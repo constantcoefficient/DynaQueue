@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# Step 1: Update and upgrade the system
+echo "Updating system packages..."
+sudo apt update && sudo apt upgrade -y
+
+# Step 2: Install prerequisites
+echo "Installing prerequisites..."
+sudo apt install -y build-essential libpcap-dev libpcre3-dev libdumbnet-dev bison flex zlib1g-dev iptables-persistent
+
+# Step 3: Install NFQUEUE and Snort
+echo "Installing NFQUEUE tools..."
+sudo apt install -y libnetfilter-queue-dev
+echo "Downloading Snort..."
+wget https://www.snort.org/downloads/snort/snort-2.9.20.tar.gz
+
+echo "Extracting Snort..."
+tar -xvzf snort-2.9.20.tar.gz
+cd snort-2.9.20
+
+echo "Building and installing Snort..."
+./configure --enable-sourcefire --enable-inline
+make
+sudo make install
+sudo ldconfig
+
+# Step 4: Configure Snort
+echo "Configuring Snort..."
+sudo mkdir -p /etc/snort/rules /var/log/snort
+sudo touch /etc/snort/rules/local.rules
+sudo cp etc/snort.conf /etc/snort/snort.conf
+
+# Replace the HOME_NET variable with the local network range
+sudo sed -i 's/^var HOME_NET .*/var HOME_NET 192.168.0.0\/24/' /etc/snort/snort.conf
+
+# Add a rule to log and block intrusions (customize as needed)
+echo "alert tcp any any -> \$HOME_NET any (msg:\"TCP intrusion detected\"; sid:1000001;)" | sudo tee /etc/snort/rules/local.rules
+
+# Step 5: Configure iptables to use NFQUEUE
+echo "Configuring iptables rules..."
+sudo iptables -A INPUT -j NFQUEUE --queue-num 0
+sudo iptables-save > /etc/iptables/rules.v4
+
+# Step 6: Set up Snort as a service
+echo "Setting up Snort as a service..."
+echo "[Unit]
+Description=Snort Intrusion Prevention System
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/snort -q -Q -c /etc/snort/snort.conf -i eth0 --daq nfq --daq-var queue=0
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/snort.service
+
+# Reload systemd and enable the Snort service
+sudo systemctl daemon-reload
+sudo systemctl enable snort
+sudo systemctl start snort
+
+# Step 7: Create a script to block ports dynamically
+echo "Creating dynamic blocking script..."
+echo "#!/bin/bash
+LOG_FILE=/var/log/snort/alert
+while inotifywait -e modify \$LOG_FILE; do
+    PORT=\$(grep \"TCP intrusion detected\" \$LOG_FILE | tail -n1 | awk '{print \$11}' | cut -d':' -f2)
+    if [ ! -z \"\$PORT\" ]; then
+        echo \"Blocking port \$PORT...\"
+        sudo iptables -A INPUT -p tcp --dport \$PORT -j DROP
+        sudo iptables-save > /etc/iptables/rules.v4
+    fi
+done" | sudo tee /usr/local/bin/block_intrusions.sh
+
+sudo chmod +x /usr/local/bin/block_intrusions.sh
+
+# Run the dynamic blocking script in the background
+echo "Running intrusion blocking script..."
+sudo nohup /usr/local/bin/block_intrusions.sh > /dev/null 2>&1 &
+
+echo "Snort IPS with dynamic blocking setup complete!"
